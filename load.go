@@ -29,12 +29,14 @@ func (i objInfo) String() string {
 }
 
 type CopyState struct {
-	objectCh chan objInfo
-	failedCh chan copyErr
-	logCh    chan objInfo
-	count    uint64
-	failCnt  uint64
-	wg       sync.WaitGroup
+	objectCh  chan objInfo
+	failedCh  chan copyErr
+	logCh     chan objInfo
+	replicate bool
+	count     uint64
+	failCnt   uint64
+	workersWg sync.WaitGroup
+	statusWg  sync.WaitGroup
 }
 
 type copyErr struct {
@@ -51,14 +53,15 @@ var (
 	copyConcurrent = 100
 )
 
-func newcopyState(ctx context.Context) *CopyState {
+func newcopyState(ctx context.Context, replicate bool) *CopyState {
 	if runtime.GOMAXPROCS(0) > copyConcurrent {
 		copyConcurrent = runtime.GOMAXPROCS(0)
 	}
 	cs := &CopyState{
-		objectCh: make(chan objInfo, copyConcurrent),
-		failedCh: make(chan copyErr, copyConcurrent),
-		logCh:    make(chan objInfo, copyConcurrent),
+		replicate: replicate,
+		objectCh:  make(chan objInfo, copyConcurrent),
+		failedCh:  make(chan copyErr, copyConcurrent),
+		logCh:     make(chan objInfo, copyConcurrent),
 	}
 
 	return cs
@@ -86,10 +89,10 @@ func (c *CopyState) getFailCount() uint64 {
 
 // addWorker creates a new worker to process tasks
 func (c *CopyState) addWorker(ctx context.Context) {
-	c.wg.Add(1)
+	c.workersWg.Add(1)
 	// Add a new worker.
 	go func() {
-		defer c.wg.Done()
+		defer c.workersWg.Done()
 		for {
 			select {
 			case <-ctx.Done():
@@ -99,7 +102,17 @@ func (c *CopyState) addWorker(ctx context.Context) {
 					return
 				}
 				logDMsg(fmt.Sprintf("Copying...%s", obj), nil)
-				if err := copyObject(ctx, obj); err != nil {
+				var err error
+				if c.replicate {
+					if obj.versionID != "" {
+						err = replicateObject(ctx, obj)
+					} else {
+						err = fmt.Errorf("replicating an object with unknown version, %s/%s", obj.bucket, obj.object)
+					}
+				} else {
+					err = copyObject(ctx, obj)
+				}
+				if err != nil {
 					c.incFailCount()
 					logMsg(fmt.Sprintf("error copying object %s: %s", obj, err))
 					c.failedCh <- copyErr{object: obj, err: err}
@@ -113,9 +126,10 @@ func (c *CopyState) addWorker(ctx context.Context) {
 }
 func (c *CopyState) finish(ctx context.Context) {
 	close(c.objectCh)
-	c.wg.Wait() // wait on workers to finish
+	c.workersWg.Wait() // wait on workers to finish
 	close(c.failedCh)
 	close(c.logCh)
+	c.statusWg.Wait()
 
 	if !dryRun {
 		logMsg(fmt.Sprintf("Copied %d objects, %d failures", c.getCount(), c.getFailCount()))
@@ -128,7 +142,9 @@ func (c *CopyState) init(ctx context.Context) {
 	for i := 0; i < copyConcurrent; i++ {
 		c.addWorker(ctx)
 	}
+	c.statusWg.Add(2)
 	go func() {
+		defer c.statusWg.Done()
 		f, err := os.OpenFile(path.Join(dirPath, getFileName(failCopyFile, "")), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 		if err != nil {
 			logDMsg("could not create + copy_fails.txt", err)
@@ -155,6 +171,7 @@ func (c *CopyState) init(ctx context.Context) {
 		}
 	}()
 	go func() {
+		defer c.statusWg.Done()
 		f, err := os.OpenFile(path.Join(dirPath, getFileName(logCopyFile, "")), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 		if err != nil {
 			logDMsg("could not create + copy_log.txt", err)
@@ -194,7 +211,49 @@ func isMethodNotAllowedErr(err error) bool {
 	}
 	return false
 }
+
 func copyObject(ctx context.Context, si objInfo) error {
+	obj, err := srcClient.GetObject(ctx, si.bucket, si.object, miniogo.GetObjectOptions{})
+	if err != nil {
+		return err
+	}
+
+	oi, err := obj.Stat()
+	if err != nil {
+		return err
+	}
+	defer obj.Close()
+	if dryRun {
+		logMsg(fmt.Sprintf("%s", oi.Key))
+		return nil
+	}
+
+	enc, ok := oi.Metadata[ContentEncoding]
+	if !ok {
+		enc = oi.Metadata[strings.ToLower(ContentEncoding)]
+	}
+
+	uoi, err := tgtClient.PutObject(ctx, tgtBucket, oi.Key, obj, oi.Size, miniogo.PutObjectOptions{
+		UserMetadata:    oi.UserMetadata,
+		ContentType:     oi.ContentType,
+		StorageClass:    oi.StorageClass,
+		UserTags:        oi.UserTags,
+		ContentEncoding: strings.Join(enc, ","),
+	})
+	if err != nil {
+		logDMsg("upload to minio failed for "+oi.Key, err)
+		return err
+	}
+	if uoi.Size != oi.Size {
+		err = fmt.Errorf("expected size %d, uploaded %d", oi.Size, uoi.Size)
+		logDMsg("upload to minio failed for "+oi.Key, err)
+		return err
+	}
+	logDMsg("Uploaded "+uoi.Key+" successfully", nil)
+	return nil
+}
+
+func replicateObject(ctx context.Context, si objInfo) error {
 	obj, err := srcClient.GetObject(ctx, si.bucket, si.object, miniogo.GetObjectOptions{
 		VersionID: si.versionID,
 	})
