@@ -224,7 +224,7 @@ func copyObject(ctx context.Context, si objInfo) error {
 				Internal: miniogo.AdvancedRemoveOptions{
 					ReplicationDeleteMarker: si.deleteMarker,
 					ReplicationMTime:        oi.LastModified,
-					ReplicationStatus:       miniogo.ReplicationStatusComplete,
+					ReplicationStatus:       tgtReplStatus(oi.ReplicationStatus),
 					ReplicationRequest:      true, // always set this to distinguish between `mc mirror` replication and serverside
 				},
 			})
@@ -245,7 +245,7 @@ func copyObject(ctx context.Context, si objInfo) error {
 			SourceMTime:       oi.LastModified,
 			SourceVersionID:   oi.VersionID,
 			SourceETag:        oi.ETag,
-			ReplicationStatus: miniogo.ReplicationStatusComplete,
+			ReplicationStatus: tgtReplStatus(oi.ReplicationStatus),
 		},
 		UserMetadata:    oi.UserMetadata,
 		ContentType:     oi.ContentType,
@@ -264,6 +264,13 @@ func copyObject(ctx context.Context, si objInfo) error {
 	}
 	logDMsg("Uploaded "+uoi.Key+" successfully", nil)
 	return nil
+}
+
+func tgtReplStatus(st string) (ns miniogo.ReplicationStatus) {
+	if st == "" {
+		return ns
+	}
+	return miniogo.ReplicationStatusComplete
 }
 
 const (
